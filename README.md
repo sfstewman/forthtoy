@@ -22,10 +22,10 @@ The recommended way to build `forthtoy` is in a separate build directory:
     cmake ..
     make
 
-    # The intepreter will be in Build/Build/
+    # The interpreter will be in Build/Build/
     ./Build/forthtoy
 
-The intepreter depends only on the C runtime.
+The interpreter depends only on the C runtime.
 
 
 ## Quirks and limitations ##
