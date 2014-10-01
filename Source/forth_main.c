@@ -11,6 +11,9 @@ int main(void)
 
   char buf[1024];
 
+  /* print status */
+  forth_parse(buf,0);
+
   while (fgets(buf,sizeof(buf),stdin) != NULL) {
     size_t n = strlen(buf+0);
     if (forth_parse(buf+0,n)<0) {

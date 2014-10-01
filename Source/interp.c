@@ -59,24 +59,25 @@ enum FORTH_VM_CODES {
   FORTH_VM_PUSHINT   =  5,
   FORTH_VM_PUSHFLT   =  6,
   FORTH_VM_PUSHADDR  =  7,
-  FORTH_VM_FETCH     =  8,
-  FORTH_VM_STORE     =  9,
-  FORTH_VM_CALL      = 10,
-  FORTH_VM_CALLC     = 11,
-  FORTH_VM_UJMP      = 12,
-  FORTH_VM_CJMP      = 13,
-  FORTH_VM_PUSHDICT  = 14,
-  FORTH_VM_POPDICT   = 15,
-  FORTH_VM_RETURN    = 16,
-  FORTH_VM_INTOP     = 17,
-  FORTH_VM_NEGATE    = 18,
-  FORTH_VM_TOP       = 19,
-  FORTH_VM_INCR      = 20,
-  FORTH_VM_DECR      = 21,
-  FORTH_VM_DO        = 22,
-  FORTH_VM_LOOP      = 23,
-  FORTH_VM_LOOPIDX   = 24,
-  FORTH_VM_EMIT      = 25,
+  FORTH_VM_PUSHCODE  =  8,
+  FORTH_VM_FETCH     =  9,
+  FORTH_VM_STORE     = 10,
+  FORTH_VM_CALL      = 11,
+  FORTH_VM_CALLC     = 12,
+  FORTH_VM_UJMP      = 13,
+  FORTH_VM_CJMP      = 14,
+  FORTH_VM_PUSHDICT  = 15,
+  FORTH_VM_POPDICT   = 16,
+  FORTH_VM_RETURN    = 17,
+  FORTH_VM_INTOP     = 18,
+  FORTH_VM_NEGATE    = 19,
+  FORTH_VM_TOP       = 20,
+  FORTH_VM_INCR      = 21,
+  FORTH_VM_DECR      = 22,
+  FORTH_VM_DO        = 23,
+  FORTH_VM_LOOP      = 24,
+  FORTH_VM_LOOPIDX   = 25,
+  FORTH_VM_EMIT      = 26,
 };
 
 enum {
@@ -253,6 +254,13 @@ static inline void pushfloat(float fp)
 {
   data_stack[data_top].type = FORTH_FLOAT32;
   data_stack[data_top].data.fp = fp;
+  data_top++;
+}
+
+static inline void pushcode(int32_t addr)
+{
+  data_stack[data_top].type = FORTH_CODE;
+  data_stack[data_top].data.val = addr;
   data_top++;
 }
 
@@ -466,14 +474,19 @@ do_fetch:
         if ((fetch.bytes[1] & 0x40) == 0x40) {
           /* clear whole stack */
           data_top = 0;
-        } else if ((fetch.bytes[1] & 0x80) == 0x80) {
-          /* return number to clear from stack */
+        } else {
           int32_t n;
-          if (fetch.half[1] > 0) {
-            n = fetch.half[1];
+          if ((fetch.bytes[1] & 0x80) == 0x80) {
+            /* return number to clear from stack */
+            if (fetch.half[1] > 0) {
+              n = fetch.half[1];
+            } else {
+              n = popint();
+            }
           } else {
-            n = popint();
+            n = 1;
           }
+
           if (n > 0) {
             data_top -= n;
             if (data_top < 0) { data_top=0; }
@@ -537,6 +550,14 @@ do_fetch:
         } while(0);
         break;
 
+      case FORTH_VM_PUSHCODE:
+        do {
+          union pair32 arg = decode_int_arg(fetch, ip);
+          pushcode(arg.i32[0]);
+          ip = arg.i32[1];
+        } while(0);
+        break;
+
       case FORTH_VM_FETCH:
         if (data_top > 0 && data_stack[data_top-1].type == FORTH_ADDRESS) {
           int32_t addr = data_stack[data_top-1].data.val;
@@ -553,11 +574,16 @@ do_fetch:
         break;
 
       case FORTH_VM_STORE:
-        if (data_top > 1 && data_stack[data_top-2].type == FORTH_ADDRESS) {
-          int32_t addr = data_stack[data_top-2].data.val;
-          forth_heap[addr+0] = data_stack[data_top-1].type;
-          forth_heap[addr+1] = data_stack[data_top-1].data.val;
-          data_top--;
+        {
+          struct forth_value dptr = popdata();
+          struct forth_value val  = popdata();
+          if (dptr.type == FORTH_ADDRESS) {
+            int32_t addr = dptr.data.val;
+            forth_heap[addr+0] = val.type;
+            forth_heap[addr+1] = val.data.val;
+          } else {
+            forth_error(FORTH_ERROR_INVALID_TYPE);
+          }
         }
         break;
 
@@ -567,7 +593,7 @@ do_fetch:
           GET_ADDR_ARG(new_ip,ip);
           if (new_ip == ip) {
             struct forth_value arg = peekdata();
-            if (arg.type != FORTH_ADDRESS) {
+            if (arg.type != FORTH_CODE) {
               forth_error(FORTH_ERROR_INVALID_TYPE);
             }
             popdata();
@@ -723,6 +749,18 @@ static void heap_mark(struct forth_dict* dict, int32_t newtop)
   dict->heap_top = newtop;
 }
 
+static inline int32_t heap_alloc(size_t nwords)
+{
+  int32_t curr_top = curr_dict->heap_top;
+  int32_t new_top =  curr_top + nwords;
+  if (new_top < emit_ptr) {
+    curr_dict->heap_top = new_top;
+    return curr_top;
+  } else {
+    return -1;
+  }
+}
+
 static int32_t addstring(char* s, uint8_t len)
 {
   uint32_t name_off = curr_dict->strpool_top;
@@ -739,7 +777,7 @@ static int32_t addstring(char* s, uint8_t len)
   return name_off;
 }
 
-static int32_t dict_lookup1(struct forth_dict* dict, char* name, size_t n)
+static int32_t dict_lookup1(struct forth_dict* dict, const char* name, size_t n)
 {
   if (n > 32) { n = 32; }
   register int32_t ind = dict->top;
@@ -756,9 +794,19 @@ static int32_t dict_lookup1(struct forth_dict* dict, char* name, size_t n)
   return -1;
 }
 
-static inline int32_t dict_lookup(struct forth_dict* dict, char* name)
+static inline int32_t dict_lookup(struct forth_dict* dict, const char* name)
 {
   return dict_lookup1(dict,name,strlen(name));
+}
+
+static inline int32_t dict_lookup_data(struct forth_dict* dict, const char* name)
+{
+  int32_t entry = dict_lookup1(dict,name,strlen(name));
+  if (entry < 0) {
+    return -1;
+  }
+
+  return dictpool[entry].data;
 }
 
 static int dict_add(struct forth_dict* dict, char* name, int32_t flags, int32_t data)
@@ -814,12 +862,44 @@ static void define_noname(void);
 static void finish_word(void);
 
 static void forth_if(void);
+static void forth_else(void);
 static void forth_then(void);
 
 static void forth_do(void);
 static void forth_loop(void);
 
+static void forth_defvar(void);
+static void forth_defconst(void);
+
 static int32_t forth_token(void);
+
+static void print_stack_top(void)
+{
+  struct forth_value data = popdata();
+  switch (data.type) {
+    case FORTH_INT32:
+      fprintf(stdout, "%d\n", (int)data.data.val);
+      break;
+
+    case FORTH_FLOAT32:
+      fprintf(stdout, "%10.5f\n", (double)data.data.fp);
+      break;
+
+    case FORTH_ADDRESS:
+      fprintf(stdout, "DPTR@0x%x\n", data.data.val);
+      break;
+
+    case FORTH_CODE:
+      fprintf(stdout, "IPTR@0x%x\n", data.data.val);
+      break;
+    case FORTH_CCODE:
+      fprintf(stdout, "CPTR@0x%x\n", data.data.val);
+      break;
+    default:
+      fprintf(stdout, "UNK@0x%x\n", data.data.val);
+      break;
+  }
+}
 
 #define EMIT(mnemonic, arg1,arg2) do {    \
   union forth_instruction inst;           \
@@ -828,6 +908,11 @@ static int32_t forth_token(void);
   inst.half[1] = arg2;                    \
   forth_heap[hp] = inst.whole;            \
   hp++;                                   \
+} while(0)
+
+#define EMIT_WORD(word) do { \
+  forth_heap[hp] = word;     \
+  hp++;                      \
 } while(0)
 
 #define ADD_CCALL(word, flags, func) do { \
@@ -840,6 +925,16 @@ static int32_t forth_token(void);
 } while(0);
 
 #define WORD(name) dict_add(dict, #name, 0, hp)
+
+#define EMIT_CALL(w) do { \
+  int32_t ip = dict_lookup_data(dict,w); \
+  if (ip >= 0) {              \
+    EMIT(PUSHCODE,0,0);   \
+    EMIT_WORD(ip);        \
+    EMIT(CALL,0x80,0);    \
+  } else {                \
+    EMIT(NOP,0,0);        \
+  } } while(0)
 
 static void forth_add_builtins(struct forth_dict* dict)
 {
@@ -931,11 +1026,19 @@ static void forth_add_builtins(struct forth_dict* dict)
   EMIT(INTOP,'|',0);
   EMIT(RETURN,0,0);
 
+  ADD_CCALL(".", 0, print_stack_top);
+
+  dict_add(dict, ".S", 0, hp);
+  EMIT(DUP,0,0);
+  EMIT_CALL(".");
+  EMIT(RETURN,0,0);
+
   ADD_CCALL(":", FORTH_FLAG_COMPILER_WORD, define_word);
   ADD_CCALL(";", FORTH_FLAG_COMPILER_WORD, finish_word);
   ADD_CCALL(":NONAME", FORTH_FLAG_COMPILER_WORD, define_noname);
 
   ADD_CCALL("IF", FORTH_FLAG_COMPILER_WORD, forth_if);
+  ADD_CCALL("ELSE", FORTH_FLAG_COMPILER_WORD, forth_else);
   ADD_CCALL("THEN", FORTH_FLAG_COMPILER_WORD, forth_then);
   // ADD_CCALL("':, 0, address
 
@@ -952,6 +1055,22 @@ static void forth_add_builtins(struct forth_dict* dict)
 
   dict_add(dict, "K", 0, hp);
   EMIT(LOOPIDX, 1, 0);
+  EMIT(RETURN,0,0);
+
+  ADD_CCALL("VARIABLE", 0, forth_defvar);
+  ADD_CCALL("CONSTANT", 0, forth_defconst);
+
+  dict_add(dict, "@", 0, hp);
+  EMIT(FETCH, 0,0);
+  EMIT(RETURN,0,0);
+
+  dict_add(dict, "!", 0, hp);
+  EMIT(STORE, 0,0);
+  EMIT(RETURN,0,0);
+
+  dict_add(dict, "?", 0, hp);
+  EMIT(FETCH, 0,0);
+  EMIT_CALL(".");
   EMIT(RETURN,0,0);
 
   heap_mark(dict, hp);
@@ -990,7 +1109,13 @@ static void print_stack(void)
         fprintf(stdout, "[%3d] %10.5f\n", (int)(data_top-i+1), (double)(data_stack[i-1].data.fp));
         break;
       case FORTH_ADDRESS:
-        fprintf(stdout, "[%3d] PTR 0x%x\n", (int)(data_top-i+1), data_stack[i-1].data.val);
+        fprintf(stdout, "[%3d] DPTR 0x%x\n", (int)(data_top-i+1), data_stack[i-1].data.val);
+        break;
+      case FORTH_CODE:
+        fprintf(stdout, "[%3d] IPTR 0x%x\n", (int)(data_top-i+1), data_stack[i-1].data.val);
+        break;
+      case FORTH_CCODE:
+        fprintf(stdout, "[%3d] CPTR 0x%x\n", (int)(data_top-i+1), data_stack[i-1].data.val);
         break;
       default:
         fprintf(stdout, "[%3d] UNK 0x%x\n", (int)(data_top-i+1), data_stack[i-1].data.val);
@@ -1033,6 +1158,62 @@ static int emit_instr(enum FORTH_VM_CODES op, unsigned char arg1, uint16_t arg2)
 
 #define EMIT_RETURN() EMIT_INSTR(RETURN,0,0)
 
+#if 0
+static int emit_call(struct forth_dict* dict, const char* word)
+{
+  int32_t ip = dict_lookup_data(dict,word);
+  if (ip < 0) {
+    /* set error! */
+    fprintf(stderr, "word %s not found in dictionary!\n",word);
+    return -1;
+  }
+  EMIT_INSTR(PUSHCODE,0,0);
+  EMIT(ip);
+  EMIT_INSTR(CALL,0x80,0);
+
+  return 0;
+}
+#endif /* 0 */
+
+// If the argument cannot be encoded, the return value will have the
+// bytes[1] field set to zero
+static union forth_instruction encode_instr_int(enum FORTH_VM_CODES opcode, int32_t arg)
+{
+  register union forth_instruction instr;
+
+  instr.whole = 0;
+  instr.bytes[0] = opcode;
+
+  if ((arg >= 0) && (arg < 0x400000)) {
+    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | 0x80;
+    instr.half[1] = arg & 0xffff;
+  } else if ((arg < 0) && (-arg < 0x400000)) {
+    arg = -arg;
+    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | 0x80 | 0x40;
+    instr.half[1] = arg & 0xffff;
+  }
+
+  return instr;
+}
+
+static int emit_instr_int(enum FORTH_VM_CODES opcode, int32_t arg)
+{
+  union forth_instruction instr = encode_instr_int(opcode, arg);
+
+  if (instr.bytes[1] != 0) {
+    return emit_word(instr.whole);
+  } else {
+    /* arg could not be encoded in the instruction, so emit the
+     * instruction and then the argument
+     */
+
+    if (emit_word(instr.whole) < 0) {
+      return -1;
+    }
+    return emit_word(arg);
+  }
+}
+
 static int forth_compile(int32_t ip)
 {
   union forth_instruction next_instr;
@@ -1063,6 +1244,60 @@ static void forth_if(void)
   }
 }
 
+static void forth_else(void)
+{
+  union forth_instruction instr;
+
+  if (forth_state == 0) {
+    /* set error! */
+    fprintf(stderr, "invalid ELSE statement!\n");
+    return;
+  }
+
+  if ((control_top == 0) || 
+      (control_stack[control_top-2] != 0x1F) || 
+      (control_stack[control_top-1] !=  0x00)) {
+    /* set error! */
+    fprintf(stderr, "control structure mismatch\n");
+    return;
+  }
+
+  /* emit branch instruction to complete IF clause.
+   * branch destination is not yet known. THEN word will
+   * adjust the branch destination.
+   */
+
+  int32_t branch_ip = emit_top;
+  if (emit_instr(FORTH_VM_UJMP, 0,0) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    return;
+  }
+
+  /* now adjust conditional of IF clause to jump
+   * to ELSE if the IF condition is false
+   */
+  int32_t branch = pop_ctl();
+  int32_t delta = emit_top - branch;
+
+  /* add branch for IF, if none present */
+  instr.whole = forth_heap[branch];
+  if (instr.bytes[1] == 0) {
+    instr = encode_instr_int(instr.bytes[0], delta);
+    if (instr.bytes[1] == 0) {
+      /* set error! */
+      fprintf(stderr, "IF..ELSE code exceeds allowed size!");
+      return;
+    }
+    forth_heap[branch] = instr.whole;
+  }
+
+  /* push the ip of the JMP before the ELSE onto control stack so
+   * THEN can adjust the jump destination
+   */
+  push_ctl(branch_ip,0x1F,0);
+}
+
 static void forth_then(void)
 {
   union forth_instruction instr;
@@ -1084,11 +1319,15 @@ static void forth_then(void)
   int32_t branch = pop_ctl();
   int32_t delta = emit_top - branch;
 
-  /* add branch information, if none present */
+  /* add branch for IF, if none present */
   instr.whole = forth_heap[branch];
   if (instr.bytes[1] == 0) {
-    instr.bytes[1] = 0x80 | ((delta >> 16) & 0x3f);
-    instr.half[1] = delta & 0xffff;
+    instr = encode_instr_int(instr.bytes[0], delta);
+    if (instr.bytes[1] == 0) {
+      /* set error! */
+      fprintf(stderr, "IF..THEN code exceeds allowed size!");
+      return;
+    }
     forth_heap[branch] = instr.whole;
   }
 
@@ -1150,8 +1389,12 @@ static void forth_loop(void)
   /* add initial branch to DO statement, if none present */
   instr.whole = forth_heap[dostmt];
   if (instr.bytes[1] == 0) {
-    instr.bytes[1] = 0x80 | ((delta >> 16) & 0x3f);
-    instr.half[1] = delta & 0xffff;
+    instr = encode_instr_int(instr.bytes[0], delta);
+    if (instr.bytes[1] == 0) {
+      /* set error! */
+      fprintf(stderr, "LOOP code exceeds allowed size!");
+      return;
+    }
     forth_heap[dostmt] = instr.whole;
   }
 
@@ -1181,6 +1424,119 @@ static void forth_loop(void)
   }
 }
 
+static void finish_word(void);
+
+static void forth_defvar(void)
+{
+  if (forth_state) {
+    /* set error! */
+    fprintf(stderr, "cannot define variables while COMPILING!\n");
+    return;
+  }
+
+  int32_t toksz = forth_token();
+  if (toksz == EOF) {
+    /* set error! */
+    fprintf(stderr, "unfinished VARIABLE definition\n");
+    return;
+  }
+
+  int32_t orig_heaptop = heap_top(curr_dict);
+
+  if (start_compiling() < 0) {
+    /* set error! */
+    return;
+  }
+
+  int32_t loc = heap_alloc(2);
+  if (loc < 0) {
+    /* set error! */
+    fprintf(stderr, "unable to allocate heap space for a variable\n");
+    goto error;
+  }
+
+  if (toksz > (int)sizeof(wordname)-1) {
+    toksz = sizeof(wordname)-1;
+  }
+
+  memcpy(wordname+0,buf_ptr,toksz);
+  if (emit_instr_int(FORTH_VM_PUSHADDR, loc) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    goto error;
+  }
+
+  finish_word();
+  return;
+
+error:
+  heap_mark(curr_dict, orig_heaptop);
+  emit_stack_top--;
+}
+
+static void forth_defconst(void)
+{
+  if (forth_state) {
+    /* set error! */
+    fprintf(stderr, "cannot define CONSTANTs while COMPILING!\n");
+    return;
+  }
+
+  if (data_top < 1) {
+    /* set error! */
+    fprintf(stderr, "data stack UNDERFLOW!\n");
+    return;
+  }
+
+  int32_t toksz = forth_token();
+  if (toksz == EOF) {
+    /* set error! */
+    fprintf(stderr, "unfinished CONSTANT definition\n");
+    return;
+  }
+
+  int32_t orig_heaptop = heap_top(curr_dict);
+
+  if (start_compiling() < 0) {
+    /* set error! */
+    return;
+  }
+
+  int32_t loc = heap_alloc(2);
+  if (loc < 0) {
+    /* set error! */
+    fprintf(stderr, "unable to allocate heap space for a variable\n");
+    goto error;
+  }
+
+  if (toksz > (int)sizeof(wordname)-1) {
+    toksz = sizeof(wordname)-1;
+  }
+
+  memcpy(wordname+0,buf_ptr,toksz);
+  if (emit_instr_int(FORTH_VM_PUSHADDR, loc) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    goto error;
+  }
+  if (emit_instr(FORTH_VM_FETCH,0,0) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    goto error;
+  }
+
+  finish_word();
+
+  struct forth_value data = popdata();
+  forth_heap[loc+0] = data.type;
+  forth_heap[loc+1] = data.data.val;
+
+  return;
+
+error:
+  heap_mark(curr_dict, orig_heaptop);
+  emit_stack_top--;
+}
 
 static int forth_literal(char* s, int32_t sz)
 {
@@ -1200,28 +1556,10 @@ static int forth_literal(char* s, int32_t sz)
   if ((endp == NULL) || (*endp == '\0')) {
     if (forth_state == 0) {
       pushint((int32_t)n);
+      return 0;
     } else {
-      instr.whole = 0;
-
-      if ((n >= 0) && (n < 0x400000)) {
-        instr.bytes[0] = FORTH_VM_PUSHINT;
-        instr.half[1] = n & 0xffff;
-        instr.bytes[1] = (n & 0x3f0000) >> 16 | 0x80;
-        EMIT(instr.whole);
-      } else if ((n < 0) && (-n < 0x400000)) {
-        n = -n;
-        instr.bytes[0] = FORTH_VM_PUSHINT;
-        instr.half[1] = n & 0xffff;
-        instr.bytes[1] = (n & 0x3f0000) >> 16 | 0x80 | 0x40;
-        EMIT(instr.whole);
-      } else {
-        instr.whole = 0;
-        instr.bytes[0] = FORTH_VM_PUSHINT;
-        EMIT(instr.whole);
-        EMIT((int32_t)n);
-      }
+      return emit_instr_int(FORTH_VM_PUSHINT, (int32_t)n);
     }
-    return 0;
   }
 
   float f = strtof(buf+0,&endp);
@@ -1449,15 +1787,21 @@ static void finish_word(void)
   curr_dict->heap_top = heap_ptr;
 
   if (forth_state) {
-    union forth_instruction instr;
-    instr.whole = 0;
-    instr.bytes[0] = FORTH_VM_PUSHADDR;
-    emit_word(instr.whole);
-    emit_word(heap_top);
+    if (emit_instr(FORTH_VM_PUSHCODE,0,0) < 0) {
+      /* set error! */
+      fprintf(stderr, "emit buffer OVERFLOW!\n");
+      return;
+    }
+
+    if (emit_word(heap_top) < 0) {
+      /* set error! */
+      fprintf(stderr, "emit buffer OVERFLOW!\n");
+      return;
+    }
   } else if (wordname[0] != '\0') {
     dict_add(curr_dict, wordname, 0, heap_top);
   } else {
-    pushaddr(heap_top);
+    pushcode(heap_top);
   }
 }
 
