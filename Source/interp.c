@@ -84,7 +84,15 @@ enum FORTH_VM_CODES {
 
 enum {
   FORTH_FLAG_COMPILER_WORD = 0x01,
+  FORTH_FLAG_NEGATE        = 0x40,  // for some ops, used as a special flag
+  FORTH_FLAG_RELATIVE      = 0x80,  // for some ops, also indicates that an argument is ENCODED
 };
+
+#define FORTH_FLAG_SPECIAL  FORTH_FLAG_NEGATE
+#define FORTH_FLAG_ENCODED  FORTH_FLAG_RELATIVE
+
+// mask for immed arguments ~(FORTH_FLAG_NEGATE | FORTH_FLAG_RELATIVE)
+#define FORTH_IMMED_MASK     0x3f
 
 #define FORTH_CELL_MEM         65536 /* 64K */
 #define FORTH_HEAP_MEM      16777216 /* 16M */
@@ -355,9 +363,9 @@ static inline union pair32 decode_int_arg(union forth_instruction fetch, int32_t
   union pair32 ret;
   int32_t v;
 
-  if (fetch.bytes[1] & 0x80) { /* ENCODED flag */
-    v = fetch.half[1] + ((fetch.bytes[1] & 0x3f) << 16);
-    if (fetch.bytes[1] & 0x40) {
+  if (fetch.bytes[1] & FORTH_FLAG_RELATIVE) { /* ENCODED flag */
+    v = fetch.half[1] + ((fetch.bytes[1] & FORTH_IMMED_MASK) << 16);
+    if (fetch.bytes[1] & FORTH_FLAG_NEGATE) {
       v = -v;
     }
   } else {
@@ -375,9 +383,9 @@ static inline union pair32 decode_addr(register union forth_instruction fetch, r
   int32_t addr;
   union pair32 ret;
 
-  if (fetch.bytes[1] & 0x80) {
-    int32_t delta = fetch.half[1] + ((fetch.bytes[1] & ~(0xC0)) << 16);
-    if (fetch.bytes[1] & 0x40) {
+  if (fetch.bytes[1] & FORTH_FLAG_RELATIVE) {
+    int32_t delta = fetch.half[1] + ((fetch.bytes[1] & FORTH_IMMED_MASK) << 16);
+    if (fetch.bytes[1] & FORTH_FLAG_NEGATE) {
       delta = -delta;
     }
     addr = ip+delta;
@@ -487,12 +495,12 @@ do_fetch:
         break;
 
       case FORTH_VM_DROP:
-        if ((fetch.bytes[1] & 0x40) == 0x40) {
+        if (fetch.bytes[1] & FORTH_FLAG_SPECIAL) {
           /* clear whole stack */
           data_top = 0;
         } else {
           int32_t n;
-          if ((fetch.bytes[1] & 0x80) == 0x80) {
+          if (fetch.bytes[1] & FORTH_FLAG_ENCODED) {
             /* return number to clear from stack */
             if (fetch.half[1] > 0) {
               n = fetch.half[1];
@@ -939,7 +947,7 @@ static void print_stack_top(void)
   forth_cfunc fp = (func);                \
   forth_cfuncs[forth_cfuncs_top] = fp;    \
   dict_add(dict, word, flags, hp);        \
-  EMIT(CALLC,0x80,forth_cfuncs_top);      \
+  EMIT(CALLC,0,forth_cfuncs_top);      \
   forth_cfuncs_top++;                     \
   EMIT(RETURN,0,0);                       \
   hp++;                                   \
@@ -949,10 +957,10 @@ static void print_stack_top(void)
 
 #define EMIT_CALL(w) do { \
   int32_t ip = dict_lookup_data(dict,w); \
-  if (ip >= 0) {              \
+  if (ip >= 0) {          \
     EMIT(PUSHCODE,0,0);   \
     EMIT_WORD(ip);        \
-    EMIT(CALL,0x80,0);    \
+    EMIT(CALL,FORTH_FLAG_RELATIVE,0); \
   } else {                \
     EMIT(NOP,0,0);        \
   } } while(0)
@@ -970,11 +978,11 @@ static void forth_add_builtins(struct forth_dict* dict)
   EMIT(RETURN,0,0);
 
   WORD(DROPALL);
-  EMIT(DROP,0x40,0);
+  EMIT(DROP,FORTH_FLAG_SPECIAL,0);
   EMIT(RETURN,0,0);
 
   WORD(DROPN);
-  EMIT(DROP,0x80,0);
+  EMIT(DROP,FORTH_FLAG_ENCODED,0);
   EMIT(RETURN,0,0);
 
   WORD(DUP);
@@ -1006,7 +1014,7 @@ static void forth_add_builtins(struct forth_dict* dict)
   EMIT(RETURN,0,0);
 
   WORD(EXECUTE);
-  EMIT(CALL,0x80,0);
+  EMIT(CALL,FORTH_FLAG_RELATIVE,0);
   EMIT(RETURN,0,0);
 
   ADD_CCALL("STATE", 0, get_state);
@@ -1206,11 +1214,11 @@ static union forth_instruction encode_instr_int(enum FORTH_VM_CODES opcode, int3
   instr.bytes[0] = opcode;
 
   if ((arg >= 0) && (arg < 0x400000)) {
-    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | 0x80;
+    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | FORTH_FLAG_ENCODED;
     instr.half[1] = arg & 0xffff;
   } else if ((arg < 0) && (-arg < 0x400000)) {
     arg = -arg;
-    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | 0x80 | 0x40;
+    instr.bytes[1] = ((arg & 0x3f0000) >> 16) | FORTH_FLAG_ENCODED | FORTH_FLAG_NEGATE;
     instr.half[1] = arg & 0xffff;
   }
 
@@ -1755,9 +1763,9 @@ static void dump_code(int32_t addr_beg, int32_t addr_end)
       default: op = "???"; break;
     }
 
-    int rflag = (instr.bytes[1] & 0x80) == 0x80;
-    int nflag = (instr.bytes[1] & 0x40) == 0x40;
-    int iarg  = ((instr.bytes[1] & 0x3f) << 16) | instr.half[1];
+    int rflag = (instr.bytes[1] & FORTH_FLAG_RELATIVE) == FORTH_FLAG_RELATIVE;
+    int nflag = (instr.bytes[1] & FORTH_FLAG_NEGATE) == FORTH_FLAG_NEGATE;
+    int iarg  = ((instr.bytes[1] & FORTH_IMMED_MASK) << 16) | instr.half[1];
     fprintf(stdout, "  %10s  %c %c 0x%06x   :: %8ld\n",
         op, rflag ? 'R' : ' ', nflag ? 'N' : ' ', iarg, (long)(instr.whole));
 
