@@ -25,6 +25,8 @@ enum FORTH_ERROR_CODE {
   FORTH_ERROR_INVALID_TYPE      ,
   FORTH_ERROR_INVALID_OPCODE    ,
 
+  FORTH_ERROR_INVALID_CCALL     ,
+
   FORTH_ERROR_UNIMPLEMENTED     ,
 };
 
@@ -88,6 +90,7 @@ enum {
 #define FORTH_HEAP_MEM      16777216 /* 16M */
 #define FORTH_STRPOOL_MEM      65536 /* 64K for strings */
 #define FORTH_DICTPOOL_SIZE    65536 /* 64K dict entries */
+#define FORTH_CFUNCS_SIZE        256 /* 256 C functions */
 
 #define FORTH_NUM_CELLS  (FORTH_CELL_MEM / sizeof(struct forth_value)) /* 64K / sizeof(forth_value) */
 #define FORTH_HEAP_SIZE  (FORTH_HEAP_MEM / sizeof(int32_t))            /* 16M / sizeof(int32_t) */
@@ -99,6 +102,9 @@ enum {
 // static struct forth_value forth_cells[FORTH_CELLS];
 static int32_t forth_heap[FORTH_HEAP_SIZE];
 static int32_t emit_ptr = FORTH_HEAP_SIZE - FORTH_EMIT_SIZE;
+
+static forth_cfunc forth_cfuncs[FORTH_CFUNCS_SIZE];
+static int forth_cfuncs_top = 0;
 
 static int32_t emit_stack[16];
 static int32_t emit_stack_top = 0;
@@ -156,10 +162,12 @@ static int forth_input_base = 0;
 
 static struct forth_dict* curr_dict = NULL;
 
+/*
 static inline void* heap_at(int32_t addr)
 {
   return (void*)(forth_heap+addr);
 }
+*/
 
 /*
 static struct forth_dict* top_dict(void)
@@ -212,12 +220,14 @@ union forth_instruction {
   int32_t whole;
 };
 
+/*
 static void forth_ccall(int32_t addr)
 {
   forth_cfunc fp = NULL;
   memcpy(&fp, heap_at(addr), sizeof(fp));
   fp();
 }
+*/
 
 static inline void pushcall(int32_t ip)
 {
@@ -379,6 +389,12 @@ static inline union pair32 decode_addr(register union forth_instruction fetch, r
   ret.i32[0] = addr;
   ret.i32[1] = ip;
   return ret;
+}
+
+static inline forth_cfunc decode_cfunc(register union forth_instruction fetch)
+{
+  // XXX - bounds check
+  return forth_cfuncs[fetch.half[1]];
 }
 
 static inline void forth_intop(union forth_instruction fetch)
@@ -607,11 +623,14 @@ do_fetch:
 
       case FORTH_VM_CALLC:
         {
-          int32_t addr;
-          GET_ADDR_ARG(addr,ip);
+          // int32_t addr;
+          forth_cfunc fp = decode_cfunc(fetch);
+          if (fp == 0) {
+            forth_error(FORTH_ERROR_INVALID_CCALL);
+          }
 
           pushcall(ip);
-          forth_ccall(addr);
+          fp();
           ip = popcall();
         }
         break;
@@ -635,10 +654,11 @@ do_fetch:
 
       case FORTH_VM_RETURN:
         {
-          int32_t ret = popcall();
-          if (ret >= 0) {
-            ip = ret;
+          int32_t ret_ip = popcall();
+          if (ret_ip >= 0) {
+            ip = ret_ip;
           } else {
+            // top of return stack
             goto cleanup;
           }
         }
@@ -917,11 +937,12 @@ static void print_stack_top(void)
 
 #define ADD_CCALL(word, flags, func) do { \
   forth_cfunc fp = (func);                \
+  forth_cfuncs[forth_cfuncs_top] = fp;    \
   dict_add(dict, word, flags, hp);        \
-  EMIT(CALLC,0x80,2);                     \
+  EMIT(CALLC,0x80,forth_cfuncs_top);      \
+  forth_cfuncs_top++;                     \
   EMIT(RETURN,0,0);                       \
-  memcpy(forth_heap+hp,&fp,sizeof(fp));   \
-  hp += (sizeof(fp) / sizeof(forth_heap[0])); \
+  hp++;                                   \
 } while(0);
 
 #define WORD(name) dict_add(dict, #name, 0, hp)
@@ -1220,11 +1241,11 @@ static int forth_compile(int32_t ip)
   next_instr.whole = forth_heap[ip+1];
   if (next_instr.bytes[0] == FORTH_VM_RETURN) {
     EMIT(forth_heap[ip]);
-  } else {
-    EMIT_INSTR(CALL,0,0);
-    EMIT(ip);
+    return 0;
   }
 
+  EMIT_INSTR(CALL,0,0);
+  EMIT(ip);
   return 0;
 }
 
@@ -1614,7 +1635,7 @@ static void print_status(void)
       curr_dict->heap_top, emit_ptr);
 }
 
-int forth_parse(char* buf, size_t n)
+int forth_parse(char *buf, size_t n)
 {
   buf_beg = buf;
   buf_end = buf + n;
