@@ -12,6 +12,8 @@
 #define NUMELTS(arr) ( sizeof((arr)) / sizeof((arr)[0]) )
 
 enum FORTH_ERROR_CODE {
+  FORTH_NEED_INPUT = -1,
+
   FORTH_OKAY = 0,
 
   FORTH_ERROR_DATA_UNDERFLOW = 1,
@@ -24,8 +26,11 @@ enum FORTH_ERROR_CODE {
 
   FORTH_ERROR_INVALID_TYPE      ,
   FORTH_ERROR_INVALID_OPCODE    ,
+  FORTH_ERROR_INVALID_IPOINTER  ,
 
   FORTH_ERROR_INVALID_CCALL     ,
+
+  FORTH_ERROR_UNKNOWN_WORD      ,
 
   FORTH_ERROR_UNIMPLEMENTED     ,
 };
@@ -80,6 +85,8 @@ enum FORTH_VM_CODES {
   FORTH_VM_LOOP      = 24,
   FORTH_VM_LOOPIDX   = 25,
   FORTH_VM_EMIT      = 26,
+  FORTH_VM_KEY       = 27,
+  FORTH_VM_RETSTACK  = 28,
 };
 
 enum {
@@ -119,6 +126,12 @@ static int32_t emit_stack_top = 0;
 #define emit_top (emit_stack[emit_stack_top-1])
 
 static unsigned char strpool[FORTH_STRPOOL_SIZE];
+
+// input buffer
+static char* buf_beg = NULL;
+static char* buf_end = NULL;
+static char* buf_ptr = NULL;
+static char* buf_nxt = NULL;
 
 struct forth_dict_entry {
   int32_t name;
@@ -469,6 +482,12 @@ static inline void forth_intop(union forth_instruction fetch)
   _var = arg.i32[0]; ip = arg.i32[1]; \
 } while(0)
 
+#define DBGVM_DUMP_STACK 0
+#define DBGVM_INFO       0
+
+static void print_stack(void);
+static void dump_code(int32_t addr_beg, int32_t addr_end);
+
 int forth_vm(int32_t ip)
 {
   union forth_instruction fetch;
@@ -489,6 +508,20 @@ int forth_vm(int32_t ip)
   for(;;) {
 do_fetch:
     fetch.whole = forth_heap[ip];
+
+    if (DBGVM_INFO) {
+      fprintf(stderr, "ip = %d, fetch = { [ 0x%02x 0x%02x 0x%02x 0x%02x ], [ 0x%04x, 0x%04x ], %d }\n",
+          ip,
+          fetch.bytes[0],fetch.bytes[1],fetch.bytes[2],fetch.bytes[3],
+          fetch.half[0],fetch.half[1],
+          fetch.whole);
+
+      dump_code(ip,ip+1);
+    }
+
+    if (DBGVM_DUMP_STACK) {
+      print_stack();
+    }
 
     switch ((enum FORTH_VM_CODES)fetch.bytes[0]) {
       case FORTH_VM_NOP:
@@ -716,6 +749,20 @@ do_fetch:
         }
         break;
 
+      case FORTH_VM_KEY:
+        {
+          // forth_error(FORTH_ERROR_UNIMPLEMENTED);
+          if (buf_nxt >= buf_end) {
+            pushcall(ip);
+            ret = FORTH_NEED_INPUT;
+            goto cleanup;
+          }
+
+          pushint((unsigned char)*buf_nxt);
+          buf_nxt++;
+        }
+        break;
+
       case FORTH_VM_INCR:
         if (data_top > 0) {
           data_stack[data_top-1].data.val++;
@@ -747,6 +794,24 @@ do_fetch:
       case FORTH_VM_TOP:
         {
           pushint(data_top);
+        }
+        break;
+
+      case FORTH_VM_RETSTACK:
+        {
+          int32_t v;
+
+          if (fetch.bytes[1] & FORTH_FLAG_NEGATE) {
+            if (call_top <= 0) {
+              forth_error(FORTH_ERROR_CONTROL_UNDERFLOW);
+            }
+
+            v = popcall();
+            pushint(v);
+          } else {
+            v = popint();
+            pushcall(v);
+          }
         }
         break;
     }
@@ -871,10 +936,6 @@ static int dict_add(struct forth_dict* dict, char* name, int32_t flags, int32_t 
   return 0;
 }
 
-static char* buf_beg = NULL;
-static char* buf_end = NULL;
-static char* buf_ptr = NULL;
-static char* buf_nxt = NULL;
 #define forth_state ((emit_stack_top > 0))
 // static int32_t forth_state = 0;
 
@@ -895,6 +956,9 @@ static void forth_then(void);
 
 static void forth_do(void);
 static void forth_loop(void);
+
+static void forth_begin(void);
+static void forth_until(void);
 
 static void forth_defvar(void);
 static void forth_defconst(void);
@@ -989,6 +1053,10 @@ static void forth_add_builtins(struct forth_dict* dict)
   EMIT(DUP,0,0);
   EMIT(RETURN,0,0);
 
+  WORD(KEY);
+  EMIT(KEY,0,0);
+  EMIT(RETURN,0,0);
+
   WORD(SWAP);
   EMIT(SWAP,0,0);
   EMIT(RETURN,0,0);
@@ -1074,6 +1142,9 @@ static void forth_add_builtins(struct forth_dict* dict)
   ADD_CCALL("DO", FORTH_FLAG_COMPILER_WORD, forth_do);
   ADD_CCALL("LOOP", FORTH_FLAG_COMPILER_WORD, forth_loop);
 
+  ADD_CCALL("BEGIN", FORTH_FLAG_COMPILER_WORD, forth_begin);
+  ADD_CCALL("UNTIL", FORTH_FLAG_COMPILER_WORD, forth_until);
+
   dict_add(dict, "I", 0, hp);
   EMIT(LOOPIDX, 0, 0);
   EMIT(RETURN,0,0);
@@ -1100,6 +1171,14 @@ static void forth_add_builtins(struct forth_dict* dict)
   dict_add(dict, "?", 0, hp);
   EMIT(FETCH, 0,0);
   EMIT_CALL(".");
+  EMIT(RETURN,0,0);
+
+  dict_add(dict, ">R", 0, hp);
+  EMIT(RETSTACK, 0, 0);
+  EMIT(RETURN,0,0);
+
+  dict_add(dict, "R>", 0, hp);
+  EMIT(RETSTACK, FORTH_FLAG_NEGATE, 0);
   EMIT(RETURN,0,0);
 
   heap_mark(dict, hp);
@@ -1372,9 +1451,84 @@ static void forth_then(void)
   if (forth_state) {
     emit_top = emit_after;
   } else {
-    if (forth_vm(branch) < 0) {
+    if (forth_vm(branch) != FORTH_OKAY) {
       /* set error! */
       fprintf(stderr, "error executing IF conditional\n");
+      return;
+    }
+  }
+}
+
+static void forth_begin(void)
+{
+  if (start_compiling() < 0) {
+    /* set error! */
+    fprintf(stderr, "cannot compile BEGIN statement!\n");
+    return;
+  }
+
+  push_ctl(emit_top,0xF0,0x01);
+}
+
+static void forth_until(void)
+{
+  int32_t begin_stmt,delta,emit_after;
+
+  if (forth_state == 0) {
+    /* set error! */
+    fprintf(stderr, "invalid UNTIL statement!\n");
+    return;
+  }
+
+  if ((control_top < 2) || 
+      (control_stack[control_top-2] != 0xF0) || 
+      (control_stack[control_top-1] != 0x01)) {
+    /* set error! */
+    fprintf(stderr, "control structure mismatch\n");
+    return;
+  }
+
+  begin_stmt = pop_ctl();
+
+  // BEGIN .... UNTIL semantics are:
+  //   when the REPEAT is encountered, pop the TOS,
+  //   if the value is FALSE (0), then jump execution
+  //   back to the instruction after the BEGIN,
+  //   otherwise exit the loop
+  if (emit_instr_int(FORTH_VM_PUSHINT, 0) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    return;
+  }
+
+  if (emit_instr(FORTH_VM_INTOP,'=',0) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    return;
+  }
+
+  delta = begin_stmt - emit_top;
+  if (emit_instr_int(FORTH_VM_CJMP,delta) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    return;
+  }
+
+  emit_after = emit_top;
+
+  if (emit_instr(FORTH_VM_RETURN,0,0) < 0) {
+    /* set error! */
+    fprintf(stderr, "emit buffer OVERFLOW\n");
+    return;
+  }
+
+  emit_stack_top--;
+  if (forth_state) {
+    emit_top = emit_after;
+  } else {
+    if (forth_vm(begin_stmt) != FORTH_OKAY) {
+      /* set error! */
+      fprintf(stderr, "error executing DO ... LOOP\n");
       return;
     }
   }
@@ -1404,7 +1558,7 @@ static void forth_loop(void)
     return;
   }
 
-  if ((control_top == 0) || 
+  if ((control_top < 2) || 
       (control_stack[control_top-2] != 0xF0) || 
       (control_stack[control_top-1] !=  0x00)) {
     /* set error! */
@@ -1445,7 +1599,7 @@ static void forth_loop(void)
   if (forth_state) {
     emit_top = emit_after;
   } else {
-    if (forth_vm(dostmt) < 0) {
+    if (forth_vm(dostmt) != FORTH_OKAY) {
       /* set error! */
       fprintf(stderr, "error executing DO ... LOOP\n");
       return;
@@ -1609,6 +1763,7 @@ static int forth_literal(char* s, int32_t sz)
   return -1;
 }
 
+#if 0
 static int parse_token(int32_t toksz)
 {
   int32_t dword = dict_lookup1(curr_dict, buf_ptr, toksz);
@@ -1626,7 +1781,7 @@ static int parse_token(int32_t toksz)
   int32_t ip = dictpool[dword].data;
   if (forth_state == 0 || (dictpool[dword].flags & FORTH_FLAG_COMPILER_WORD) ) {
     int ret = forth_vm(ip);
-    if (ret < 0) {
+    if (ret != FORTH_OKAY) {
       return ret;
     }
 
@@ -1635,6 +1790,7 @@ static int parse_token(int32_t toksz)
     return forth_compile(ip);
   }
 }
+#endif /* 0 */
 
 static void print_status(void)
 {
@@ -1643,6 +1799,8 @@ static void print_status(void)
       curr_dict->heap_top, emit_ptr);
 }
 
+static int forth_parse_inner(void);
+
 int forth_parse(char *buf, size_t n)
 {
   buf_beg = buf;
@@ -1650,21 +1808,69 @@ int forth_parse(char *buf, size_t n)
 
   buf_ptr = buf_nxt = buf_beg;
 
-  int32_t toksz = forth_token();
-  while (toksz > 0) {
-    int ret = parse_token(toksz);
-    if (ret < 0) {
-      /* abort compilation */
-      emit_stack_top = 0;
+  while(buf_ptr < buf_end) {
+    int ret = forth_parse_inner();
+
+    if (ret == FORTH_NEED_INPUT) {
+      return ret;
     }
 
-    toksz = forth_token();
+    if (ret != FORTH_OKAY) {
+      /* abort execution or compilation */
+      emit_stack_top = 0;
+      call_top = 0;
+      break;
+    }
   }
 
   print_status();
 
   buf_ptr = buf_beg = buf_end = NULL;
   return 0;
+}
+
+static int forth_parse_inner(void)
+{
+    int32_t ip;
+    int cword = 0;
+
+    if (call_top > 0) {
+      ip = popcall();
+    } else {
+      int32_t toksz, dword;
+
+      toksz = forth_token();
+      if (toksz <= 0) {
+        return 0;
+      }
+
+      dword = dict_lookup1(curr_dict, buf_ptr, toksz);
+
+      if (dword < 0) {
+        if (forth_literal(buf_ptr,toksz) == 0) {
+          return FORTH_OKAY;
+        }
+
+        // XXX - better error handling
+        fprintf(stderr, "word not found: ");
+        fwrite(buf_ptr, toksz, 1, stderr);
+        fputc('\n', stderr);
+        return FORTH_ERROR_UNKNOWN_WORD;
+      }
+
+      ip = dictpool[dword].data;
+      cword = dictpool[dword].flags & FORTH_FLAG_COMPILER_WORD;
+    }
+
+    if (ip < 0) {
+      return FORTH_ERROR_INVALID_IPOINTER;
+    }
+
+    if (forth_state == 0 || cword) {
+      return forth_vm(ip);
+    } else {
+      return forth_compile(ip);
+    }
 }
 
 static int start_compiling(void)
@@ -1759,6 +1965,8 @@ static void dump_code(int32_t addr_beg, int32_t addr_end)
       case FORTH_VM_LOOP:       op = "LOOP"; break;
       case FORTH_VM_LOOPIDX:    op = "LOOPIDX"; break;
       case FORTH_VM_EMIT:       op = "EMIT"; break;
+      case FORTH_VM_KEY:        op = "KEY"; break;
+      case FORTH_VM_RETSTACK:   op = "RETSTACK"; break;
 
       default: op = "???"; break;
     }
@@ -1766,8 +1974,9 @@ static void dump_code(int32_t addr_beg, int32_t addr_end)
     int rflag = (instr.bytes[1] & FORTH_FLAG_RELATIVE) == FORTH_FLAG_RELATIVE;
     int nflag = (instr.bytes[1] & FORTH_FLAG_NEGATE) == FORTH_FLAG_NEGATE;
     int iarg  = ((instr.bytes[1] & FORTH_IMMED_MASK) << 16) | instr.half[1];
-    fprintf(stdout, "  %10s  %c %c 0x%06x   :: %8ld\n",
-        op, rflag ? 'R' : ' ', nflag ? 'N' : ' ', iarg, (long)(instr.whole));
+    fprintf(stdout, "  %10s  %c %c %c 0x%06x   :: %8ld\n",
+        op, (instr.bytes[0] == FORTH_VM_INTOP ? instr.bytes[1] : ' '),
+        rflag ? 'R' : ' ', nflag ? 'N' : ' ', iarg, (long)(instr.whole));
 
     ++addr_beg;
   }
