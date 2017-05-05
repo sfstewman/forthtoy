@@ -7,12 +7,12 @@ extern int forth_parse(char* buf, size_t n);
 
 int main(void)
 {
-  forth_init();
-
   char buf[1024];
 
+  forth_init();
+
   /* print status */
-  forth_parse(buf,0);
+  (void)forth_parse(buf,0);
 
   while (fgets(buf,sizeof(buf),stdin) != NULL) {
     size_t n = strlen(buf+0);
